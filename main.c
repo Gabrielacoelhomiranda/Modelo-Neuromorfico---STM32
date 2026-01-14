@@ -1,4 +1,4 @@
-GABRIELA COELHO/* ========================== INCLUDES ==================================== */
+/* ========================== INCLUDES ==================================== */
 #include "stm32f7xx_hal.h"
 #include <stdio.h>
 #include <stdlib.h>
