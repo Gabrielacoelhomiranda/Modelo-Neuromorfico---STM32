@@ -163,7 +163,7 @@ void update_taxels(Taxel *t, uint16_t *adc) {
         t[i].v = v;
         t[i].u = u;
 
-        // Envia corrente I para o Python (opcional: pode ser só para IDX_VALIDACAO)
+        // Envia corrente I para o Python 
         if ((current_row * COLS + i) == IDX_VALIDACAO)
         {
             int n = snprintf(msg, sizeof(msg),
