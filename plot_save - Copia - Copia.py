@@ -12,8 +12,7 @@ time.sleep(2)
 # ================= PARAMETROS =================
 ROWS, COLS = 4, 4
 NUM_TAXELS = ROWS * COLS
-IDX_VALIDACAO = 10  # taxel que vamos monitorar
-
+IDX_VALIDACAO = 10  
 # ================= BUFFERS =================
 time_data = []
 current_vals = []
@@ -28,8 +27,7 @@ ax.set_ylabel("Corrente (I)")
 ax.set_title(f"Corrente do Taxel {IDX_VALIDACAO} em tempo real")
 ax.legend()
 ax.set_xlim(0, 60)  # exibe 60 segundos
-ax.set_ylim(0, 10)  # ajuste conforme seu range de corrente
-
+ax.set_ylim(0, 10)  
 # ================= UPDATE =================
 def update(frame):
     now = time.time()
