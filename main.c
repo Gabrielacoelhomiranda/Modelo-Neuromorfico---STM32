@@ -1,4 +1,5 @@
 /* ========================== INCLUDES ========================== */
+// BIBLIOTECAS
 #include "stm32f7xx_hal.h"
 #include "usb_device.h"
 #include "usbd_cdc_if.h"
@@ -10,19 +11,22 @@
 /* ========================== DEFINIÇÕES ========================== */
 #define ROWS 4
 #define COLS 4
-#define NUM_TAXELS (ROWS*COLS)
-#define MSG_SIZE 128
+#define NUM_TAXELS (ROWS*COLS) //16 TAXELS
 
-#define VTH 30.0f
+/* Modelo de Izhikevich */
+#define VTH 30.0f // LIMIAR DE POTENCIAL DE MEMBRANA
 #define A 0.02f
 #define B 0.2f
 #define C -65.0f
 #define D 8.0f
 #define DT 1.0f
-#define G 10.0f
+#define G 10.0f // GANHO
+#define IDX_VALIDACAO 10  // taxel que você quer validar
 
 #define V_MIN 0.5f
 #define V_MAX 3.3f
+
+#define USB_TX_BUFFER_SIZE 1024  // BUFFER CIRCULAR
 
 /* ========================== ESTRUTURAS ========================== */
 typedef struct {
@@ -49,6 +53,11 @@ Taxel taxels[NUM_TAXELS];
 uint16_t adc_buffer[COLS];
 uint8_t current_row = 0;
 
+/* ========================== USB BUFFER ========================== */
+uint8_t usb_tx_buffer[USB_TX_BUFFER_SIZE];
+volatile uint16_t usb_head = 0;
+volatile uint16_t usb_tail = 0;
+
 /* ========================== GPIO MAP ========================== */
 GPIO_Map rows[ROWS] = {
     {GPIOC, GPIO_PIN_0},
@@ -64,13 +73,47 @@ void MX_DMA_Init(void);
 void MX_ADC1_Init(void);
 void MX_TIM6_Init(void);
 void MX_TIM2_Init(void);
-void Error_Handler(void);
 
 void select_row(uint8_t row);
-void update_taxels_usb(Taxel *t, uint16_t *adc, int num);
+void update_taxels(Taxel *t, uint16_t *adc);
+void usb_buffer_write(const char *data, uint16_t len);
+void usb_buffer_process(void);
 
-/* ========================== FUNÇÕES ========================== */
+/* ========================== USB BUFFER ========================== */
+void usb_buffer_write(const char *data, uint16_t len)
+{
+    for (uint16_t i = 0; i < len; i++)
+    {
+        uint16_t next = (usb_head + 1) % USB_TX_BUFFER_SIZE;
+        if (next != usb_tail)
+        {
+            usb_tx_buffer[usb_head] = data[i];
+            usb_head = next;
+        }
+    }
+}
 
+void usb_buffer_process(void)
+{
+    static uint8_t packet[64];
+
+    if (usb_head == usb_tail) return;
+    if (hUsbDeviceFS.dev_state != USBD_STATE_CONFIGURED) return;
+
+    uint16_t len = 0;
+    uint16_t temp_tail = usb_tail;
+
+    while (temp_tail != usb_head && len < sizeof(packet))
+    {
+        packet[len++] = usb_tx_buffer[temp_tail];
+        temp_tail = (temp_tail + 1) % USB_TX_BUFFER_SIZE;
+    }
+
+    if (CDC_Transmit_FS(packet, len) == USBD_OK)
+        usb_tail = temp_tail;
+}
+
+/* ========================== ROW SELECT ========================== */
 void select_row(uint8_t row)
 {
     for (uint8_t i = 0; i < ROWS; i++)
@@ -78,77 +121,83 @@ void select_row(uint8_t row)
 
     HAL_GPIO_WritePin(rows[row].port, rows[row].pin, GPIO_PIN_SET);
 
-    for (volatile int i = 0; i < 50; i++); // micro delay
+    for (volatile int i = 0; i < 50; i++);
 }
 
-/* ========================== UPDATE TAXELS ========================== */
-void update_taxels_usb(Taxel *t, uint16_t *adc, int num)
-{
-    static uint32_t last_usb_time = 0;
-    uint32_t now = HAL_GetTick();
+/* ========================== TAXELS UPDATE ========================== */
+void update_taxels(Taxel *t, uint16_t *adc) {
+    char msg[128];
 
-    char msg[MSG_SIZE];
-    int len = 0;
+    // TIM2: contador em µs
+    uint32_t tstamp = __HAL_TIM_GET_COUNTER(&htim2);
+    uint32_t t_ms = tstamp / 1000;  // converte para ms
 
-    for (int i = 0; i < num; i++)
-    {
-        float V = adc[i] * (V_MAX / 4095.0f);
+    // Atualiza cada coluna do taxel
+    for (int i = 0; i < COLS; i++) {
+        // Normaliza leitura ADC
+        float V  = adc[i] * (V_MAX / 4095.0f);
         float Vn = (V_MAX - V) / (V_MAX - V_MIN);
         Vn = fmaxf(0.0f, fminf(1.0f, Vn));
 
+        // Corrente de entrada para Izhikevich
         t[i].I = G * Vn;
 
+        // Atualiza o neurônio
         float v = t[i].v;
         float u = t[i].u;
 
-        v += DT * (0.04f*v*v + 5*v + 140 - u + t[i].I);
-        u += DT * (A * (B*v - u));
+        v += DT * (0.04f * v * v + 5 * v + 140 - u + t[i].I);
+        u += DT * (A * (B * v - u));
 
-        /* ===== SPIKE ===== */
-        if (v >= VTH)
-        {
+        // Detecta spike
+        if (v >= VTH) {
             v = C;
             u += D;
 
-            uint32_t tstamp = __HAL_TIM_GET_COUNTER(&htim2);
-
-            char spike_msg[64];
-            snprintf(spike_msg, sizeof(spike_msg),
-                     "SPIKE idx=%d t=%lu\r\n",
-                     current_row*COLS + i, tstamp);
-
-            if (hUsbDeviceFS.dev_state == USBD_STATE_CONFIGURED)
-                CDC_Transmit_FS((uint8_t*)spike_msg, strlen(spike_msg));
+            int n = snprintf(msg, sizeof(msg),
+                             "SPIKE,idx=%d,t=%lu\r\n",
+                             current_row * COLS + i, t_ms);
+            usb_buffer_write(msg, n);
         }
 
         t[i].v = v;
         t[i].u = u;
 
-        /* ===== DEBUG PERIÓDICO ===== */
-        if (now - last_usb_time >= 50)
+        // Envia corrente I para o Python (opcional: pode ser só para IDX_VALIDACAO)
+        if ((current_row * COLS + i) == IDX_VALIDACAO)
         {
-            len += snprintf(msg + len, MSG_SIZE - len,
-                            "Row %d Col %d | V=%.3f I=%.3f\r\n",
-                            current_row, i, V, t[i].I);
+            int n = snprintf(msg, sizeof(msg),
+                             "I,idx=%d,t=%lu,I=%.3f\r\n",
+                             current_row * COLS + i, t_ms, t[i].I);
+            usb_buffer_write(msg, n);
         }
-    }
-
-    if ((now - last_usb_time >= 50) && len > 0 &&
-        hUsbDeviceFS.dev_state == USBD_STATE_CONFIGURED)
-    {
-        CDC_Transmit_FS((uint8_t*)msg, len);
-        last_usb_time = now;
     }
 }
 
-/* ========================== TIM6 CALLBACK ========================== *///////
+
+
+
+/* ========================== ADC CALLBACK ========================== */
+void HAL_ADC_ConvCpltCallback(ADC_HandleTypeDef *hadc)
+{
+    if (hadc == &hadc1)
+    {
+
+
+        update_taxels(&taxels[current_row * COLS], adc_buffer);
+
+        current_row = (current_row + 1) % ROWS;
+        select_row(current_row);
+    }
+}
+
+
+/* ========================== TIM6 CALLBACK ========================== */
 void HAL_TIM_PeriodElapsedCallback(TIM_HandleTypeDef *htim)
 {
     if (htim == &htim6)
     {
-        update_taxels_usb(&taxels[current_row * COLS], adc_buffer, COLS);
-        current_row = (current_row + 1) % ROWS;
-        select_row(current_row);
+        /* TIM6 apenas gera TRGO */
     }
 }
 
@@ -165,28 +214,28 @@ int main(void)
     MX_TIM2_Init();
     MX_USB_DEVICE_Init();
 
-    while (hUsbDeviceFS.dev_state != USBD_STATE_CONFIGURED);
-
     for (int i = 0; i < NUM_TAXELS; i++)
     {
         taxels[i].v = -30.0f;
         taxels[i].u = B * taxels[i].v;
-        taxels[i].I = 0;
+        taxels[i].I = 0.0f;
     }
 
-    select_row(current_row);
+    select_row(0);
 
-    /* ADC + DMA CIRCULAR (UMA ÚNICA VEZ) */
-    HAL_ADC_Start_DMA(&hadc1, (uint32_t*)adc_buffer, COLS);
-
-    HAL_TIM_Base_Start_IT(&htim6);
     HAL_TIM_Base_Start(&htim2);
+    HAL_ADC_Start_DMA(&hadc1, (uint32_t*)adc_buffer, COLS);
+    HAL_TIM_Base_Start_IT(&htim6);
+
+    usb_buffer_write("BOOT OK\r\n", 9);
 
     while (1)
     {
-
+        usb_buffer_process();
+        HAL_Delay(1);
     }
 }
+
 
 /* ========================== PERIFÉRICOS ========================== */
 
@@ -223,7 +272,12 @@ void MX_DMA_Init(void)
 
     HAL_DMA_Init(&hdma_adc1);
     __HAL_LINKDMA(&hadc1, DMA_Handle, hdma_adc1);
+
+    /* 🔥 ISSO AQUI É O QUE FALTAVA */
+    HAL_NVIC_SetPriority(DMA2_Stream0_IRQn, 0, 0);
+    HAL_NVIC_EnableIRQ(DMA2_Stream0_IRQn);
 }
+
 
 void MX_ADC1_Init(void)
 {
@@ -234,10 +288,11 @@ void MX_ADC1_Init(void)
     hadc1.Instance = ADC1;
     hadc1.Init.Resolution = ADC_RESOLUTION_12B;
     hadc1.Init.ScanConvMode = ENABLE;
-    hadc1.Init.ContinuousConvMode = ENABLE;
+    hadc1.Init.ContinuousConvMode = DISABLE;
     hadc1.Init.NbrOfConversion = COLS;
-    hadc1.Init.ExternalTrigConv = ADC_SOFTWARE_START;
-    hadc1.Init.DMAContinuousRequests = ENABLE;
+    hadc1.Init.ExternalTrigConv = ADC_EXTERNALTRIGCONV_T6_TRGO;
+    hadc1.Init.ExternalTrigConvEdge = ADC_EXTERNALTRIGCONVEDGE_RISING;
+    hadc1.Init.DMAContinuousRequests = ENABLE;   // <<< CRÍTICO NO F7
     HAL_ADC_Init(&hadc1);
 
     uint32_t ch[COLS] = {
@@ -256,6 +311,7 @@ void MX_ADC1_Init(void)
     }
 }
 
+
 void MX_TIM6_Init(void)
 {
     __HAL_RCC_TIM6_CLK_ENABLE();
@@ -264,6 +320,11 @@ void MX_TIM6_Init(void)
     htim6.Init.Prescaler = 83;
     htim6.Init.Period = 249;
     HAL_TIM_Base_Init(&htim6);
+
+    TIM_MasterConfigTypeDef s = {0};
+    s.MasterOutputTrigger = TIM_TRGO_UPDATE;
+    s.MasterSlaveMode = TIM_MASTERSLAVEMODE_DISABLE;
+    HAL_TIMEx_MasterConfigSynchronization(&htim6, &s);
 }
 
 void MX_TIM2_Init(void)
@@ -300,9 +361,13 @@ void SystemClock_Config(void)
     HAL_RCC_ClockConfig(&c, FLASH_LATENCY_5);
 }
 
+void DMA2_Stream0_IRQHandler(void)
+{
+    HAL_DMA_IRQHandler(&hdma_adc1);
+}
+
 void Error_Handler(void)
 {
     __disable_irq();
     while (1);
 }
-
