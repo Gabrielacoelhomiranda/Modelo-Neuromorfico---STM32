@@ -5,7 +5,7 @@ from matplotlib.animation import FuncAnimation
 import re
 import time
 
-# ================= CONFIG =================
+# ================= CONFIG ===================
 PORT = 'COM9'           # porta serial do STM32
 BAUD = 115200           # baudrate
 ROWS, COLS = 5, 5
