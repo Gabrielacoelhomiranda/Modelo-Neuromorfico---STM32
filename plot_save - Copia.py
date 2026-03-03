@@ -74,7 +74,7 @@ def update(frame):
                     # opcional: adc = int(match.group(2))
                     spike_times[idx].append(elapsed)
 
-    # ===== ATUALIZA HEATMAP VOLTAGEM =====
+    # ===== ATUALIZA HEATMAP VOLTAGEM ========
     im_volt.set_data(voltage_matrix)
     im_volt.set_clim(0, VREF)
     for r in range(ROWS):
