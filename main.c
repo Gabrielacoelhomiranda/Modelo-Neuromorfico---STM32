@@ -1,4 +1,4 @@
-/* ========================== INCLUDES ========================== */
+/*======================= INCLUDES ========================== */
 #include "stm32f7xx_hal.h"
 #include "usb_device.h"
 #include "usbd_cdc_if.h"
@@ -8,28 +8,51 @@
 #include <stdbool.h>
 
 /* ========================== DEFINIÇÕES ========================== */
+#define DEBUG_ADC_PORT GPIOB
+#define DEBUG_ADC_PIN  GPIO_PIN_8 //(GPIO DE PULSO PRA ADC)
+#define DEBUG_IZH_PORT GPIOB
+#define DEBUG_IZH_PIN  GPIO_PIN_9//(GPIO DE PULSO PRA Izhikevich)
+
+//////////////////////////////////////////////
 #define ROWS 5
 #define COLS 5
 #define NUM_TAXELS (ROWS*COLS)
+#define DIFF_BUFFER 25
+static uint8_t row_mask = 0x1E;
+
+/* ===== IZH PARAMETERS ===== */
+
+/* Adap Rapida */
+#define A_RA 0.1f
+#define B_RA 0.2f
+#define C_RA -65.0f
+#define D_RA 2.0f
+#define G_RA 400.0f
+
+/* Adap lenta */
+#define A_SA 0.02f
+#define B_SA 0.2f
+#define C_SA -65.0f
+#define D_SA 8.0f
+#define G_SA 25.0f
+
+#define DT 0.10f
 
 #define VTH 30.0f
-#define A 0.02f
-#define B 0.2f
-#define C -65.0f
-#define D 8.0f
-#define DT 0.10f
-#define G 20.0f
-
-#define V_MIN 0.5f
+#define V_MIN 0.0f
 #define V_MAX 3.3f
 #define USB_TX_BUFFER_SIZE 4096
 #define USB_PACKET_SIZE 64
-#define SEND_INTERVAL_MS 10  // envio ADC a cada 10 ms
+#define SEND_INTERVAL_MS 100  // envio ADC a cada 10 ms
 
 /* ========================== ESTRUTURAS ========================== */
 typedef struct {
-    float v;
-    float u;
+    float v_RA;
+    float u_RA;
+
+    float v_SA;
+    float u_SA;
+
     float I;
 } Taxel;
 
@@ -50,20 +73,26 @@ Taxel taxels[NUM_TAXELS];
 uint16_t adc_buffer[COLS];
 uint8_t current_row = 0;
 
-volatile uint8_t spike_flags[NUM_TAXELS] = {0};
+volatile uint8_t spike_flags_RA[NUM_TAXELS] = {0};
+volatile uint8_t spike_flags_SA[NUM_TAXELS] = {0};
+
 volatile uint16_t last_adc[NUM_TAXELS] = {0};
+
+float I_buffer[NUM_TAXELS][DIFF_BUFFER] = {0};
+uint8_t I_index[NUM_TAXELS] = {0};
 
 uint8_t usb_tx_buffer[USB_TX_BUFFER_SIZE];
 volatile uint16_t usb_head = 0;
 volatile uint16_t usb_tail = 0;
 
+
 /* ========================== GPIO MAP ========================== */
 GPIO_Map rows[ROWS] = {
-    {GPIOC, GPIO_PIN_0},
-    {GPIOC, GPIO_PIN_3},
-    {GPIOF, GPIO_PIN_3},
-    {GPIOF, GPIO_PIN_5},
-    {GPIOF, GPIO_PIN_10}
+		{GPIOF, GPIO_PIN_10},
+		{GPIOF, GPIO_PIN_5},
+		{GPIOF, GPIO_PIN_3},
+		{GPIOC, GPIO_PIN_3},
+		{GPIOC, GPIO_PIN_0}
 };
 
 /* ========================== PROTÓTIPOS ========================== */
@@ -124,45 +153,91 @@ void usb_buffer_process(void)
 }
 
 /* ========================== SELECT ROW ========================== */
+static inline uint8_t rol5(uint8_t v)
+{
+    return ((v << 1) | (v >> 4)) & 0x1F;
+}
+
 void select_row(uint8_t row)
 {
-    for (uint8_t i = 0; i < ROWS; i++)
-        HAL_GPIO_WritePin(rows[i].port, rows[i].pin, GPIO_PIN_RESET);
-
-    HAL_GPIO_WritePin(rows[row].port, rows[row].pin, GPIO_PIN_SET);
-
-    for (volatile int i = 0; i < 50; i++); // pequeno delay
+	HAL_GPIO_WritePin(GPIOF, GPIO_PIN_10, (row_mask & (1<<0)) ? GPIO_PIN_SET : GPIO_PIN_RESET);
+	HAL_GPIO_WritePin(GPIOF, GPIO_PIN_5,  (row_mask & (1<<1)) ? GPIO_PIN_SET : GPIO_PIN_RESET);
+	HAL_GPIO_WritePin(GPIOF, GPIO_PIN_3,  (row_mask & (1<<2)) ? GPIO_PIN_SET : GPIO_PIN_RESET);
+	HAL_GPIO_WritePin(GPIOC, GPIO_PIN_3,  (row_mask & (1<<3)) ? GPIO_PIN_SET : GPIO_PIN_RESET);
+	HAL_GPIO_WritePin(GPIOC, GPIO_PIN_0,  (row_mask & (1<<4)) ? GPIO_PIN_SET : GPIO_PIN_RESET);
+	row_mask = rol5(row_mask);
 }
 
 /* ========================== IZHIKEVICH ========================== */
 void update_taxels(Taxel *t, uint16_t *adc, uint8_t row_idx)
 {
+    HAL_GPIO_WritePin(DEBUG_IZH_PORT, DEBUG_IZH_PIN, GPIO_PIN_SET);
+
     for (int i = 0; i < COLS; i++)
     {
+        int global_idx = row_idx * COLS + i;
+
         float V = adc[i] * (V_MAX / 4095.0f);
         float Vn = (V_MAX - V) / (V_MAX - V_MIN);
 
-        t[i].I = G * Vn;
+        float I_raw = Vn;
 
-        float v = t[i].v;
-        float u = t[i].u;
+        /* ===== BUFFER DERIVADA ===== */
 
-        v += DT * (0.04f*v*v + 5*v + 140 - u + t[i].I);
-        u += DT * (A * (B*v - u));
+        uint8_t idx = I_index[global_idx];
+        float I_old = I_buffer[global_idx][idx];
 
-        int global_idx = row_idx * COLS + i;
-        last_adc[global_idx] = adc[i];
+        I_buffer[global_idx][idx] = I_raw;
+        I_index[global_idx] = (idx + 1) % DIFF_BUFFER;
+
+        float dI = fabsf(I_raw - I_old)/ (DIFF_BUFFER * DT);
+
+        if (dI < 0.02f)
+            dI = 0;
+
+        float I_RA = G_RA * dI;
+        float I_SA = G_SA * I_raw;
+
+        /* ===== RAPID ADAPTATION ===== */
+
+        float v = t[i].v_RA;
+        float u = t[i].u_RA;
+
+        v += DT * (0.04f*v*v + 5*v + 140 - u + I_RA);
+        u += DT * (A_RA * (B_RA * v - u));
 
         if (v >= VTH)
         {
-            v = C;
-            u += D;
-            spike_flags[global_idx] = 1;
+            v = C_RA;
+            u += D_RA;
+            spike_flags_RA[global_idx] = 1;
         }
 
-        t[i].v = v;
-        t[i].u = u;
+        t[i].v_RA = v;
+        t[i].u_RA = u;
+
+        /* ===== SLOW ADAPTATION ===== */
+
+        v = t[i].v_SA;
+        u = t[i].u_SA;
+
+        v += DT * (0.04f*v*v + 5*v + 140 - u + I_SA);
+        u += DT * (A_SA * (B_SA * v - u));
+
+        if (v >= VTH)
+        {
+            v = C_SA;
+            u += D_SA;
+            spike_flags_SA[global_idx] = 1;
+        }
+
+        t[i].v_SA = v;
+        t[i].u_SA = u;
+
+        last_adc[global_idx] = adc[i];
     }
+
+    HAL_GPIO_WritePin(DEBUG_IZH_PORT, DEBUG_IZH_PIN, GPIO_PIN_RESET);
 }
 
 /* ========================== PROCESS SPIKES ========================== */
@@ -176,17 +251,27 @@ bool process_spikes(void)
 
     for (int i = 0; i < NUM_TAXELS; i++)
     {
-        if (spike_flags[i])
+        if (spike_flags_RA[i])
         {
-            spike_flags[i] = 0;
+            spike_flags_RA[i] = 0;
             has_spike = true;
 
             int n = snprintf(msg, sizeof(msg),
-                             "SPIKE,idx=%d,adc=%d,t=%lu\r\n",
+                             "RA,idx=%d,adc=%d,t=%lu\r\n",
                              i, last_adc[i], tstamp);
 
-            if ((batch_count + n) >= USB_TX_BUFFER_SIZE)
-                n = USB_TX_BUFFER_SIZE - batch_count;
+            memcpy(batch_msg + batch_count, msg, n);
+            batch_count += n;
+        }
+
+        if (spike_flags_SA[i])
+        {
+            spike_flags_SA[i] = 0;
+            has_spike = true;
+
+            int n = snprintf(msg, sizeof(msg),
+                             "SA,idx=%d,adc=%d,t=%lu\r\n",
+                             i, last_adc[i], tstamp);
 
             memcpy(batch_msg + batch_count, msg, n);
             batch_count += n;
@@ -239,9 +324,18 @@ void HAL_ADC_ConvCpltCallback(ADC_HandleTypeDef *hadc)
 {
     if (hadc == &hadc1)
     {
-        select_row(current_row);  // Seleciona linha antes de processar ADC
+    	HAL_GPIO_WritePin(DEBUG_ADC_PORT, DEBUG_ADC_PIN, GPIO_PIN_SET);///// PULSO NO GPIO ADC NO INICIO DA DIGITALIZAÇÃO
+
+    	///////////////////////////
+
+    	select_row(current_row); //Seleciona linha antes de processar ADC
         update_taxels(&taxels[current_row * COLS], adc_buffer, current_row);
         current_row = (current_row + 1) % ROWS;
+        if (current_row >= ROWS)
+			current_row=0;
+
+        /////////////////////////////////
+        HAL_GPIO_WritePin(DEBUG_ADC_PORT, DEBUG_ADC_PIN, GPIO_PIN_RESET);///// PULSO NO GPIO ADC NO FIM DIGITALIZAÇÃO
     }
 }
 
@@ -260,8 +354,11 @@ int main(void)
 
     for (int i = 0; i < NUM_TAXELS; i++)
     {
-        taxels[i].v = -30.0f;
-        taxels[i].u = B * taxels[i].v;
+        taxels[i].v_RA = -30.0f;
+        taxels[i].u_RA = B_RA * taxels[i].v_RA;
+        taxels[i].v_SA = -30.0f;
+        taxels[i].u_SA = B_SA * taxels[i].v_SA;
+
         taxels[i].I = 0.0f;
     }
 
@@ -312,6 +409,20 @@ void MX_GPIO_Init(void)
 
     g.Pin = GPIO_PIN_2 | GPIO_PIN_4; // ADC6 e ADC9
     HAL_GPIO_Init(GPIOF, &g);       // Ajuste dependendo do seu mapeamento
+
+    ///////////////////////////////////////////////////////////
+
+    __HAL_RCC_GPIOB_CLK_ENABLE(); //// DEFINIÇÃO DE GPIO COMO OUTPUT
+
+
+    g.Mode = GPIO_MODE_OUTPUT_PP;
+    g.Pull = GPIO_NOPULL;
+    g.Speed = GPIO_SPEED_FREQ_VERY_HIGH;
+
+    g.Pin = DEBUG_ADC_PIN | DEBUG_IZH_PIN;
+    HAL_GPIO_Init(GPIOB, &g);
+
+    /////////////////////////////////////////////////////////////////
 }
 
 /* ========================== DMA ========================== */
@@ -360,11 +471,11 @@ void MX_ADC1_Init(void)
     HAL_ADC_Init(&hadc1);
 
     uint32_t ch[COLS] = {
-        ADC_CHANNEL_9,
-        ADC_CHANNEL_6,
-        ADC_CHANNEL_3,
-        ADC_CHANNEL_0,
-        ADC_CHANNEL_4
+    	ADC_CHANNEL_0,
+		ADC_CHANNEL_3,
+		ADC_CHANNEL_4,
+    	ADC_CHANNEL_6,
+    	ADC_CHANNEL_9,
     };
 
     for (int i = 0; i < COLS; i++)
@@ -383,7 +494,7 @@ void MX_TIM6_Init(void)
 
     htim6.Instance = TIM6;
     htim6.Init.Prescaler = 83;
-    htim6.Init.Period = 199;
+    htim6.Init.Period = 199; //microsegundos -- cada taxel atualizado em 1 ms
 
     HAL_TIM_Base_Init(&htim6);
 
@@ -434,4 +545,3 @@ void Error_Handler(void)
     __disable_irq();
     while (1);
 }
-
