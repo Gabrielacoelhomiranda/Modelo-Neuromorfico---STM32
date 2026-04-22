@@ -1,4 +1,4 @@
-/*======================= INCLUDES ========================== */
+
 #include "stm32f7xx_hal.h"
 #include "usb_device.h"
 #include "usbd_cdc_if.h"
@@ -7,7 +7,7 @@
 #include <string.h>
 #include <stdbool.h>
 
-/* ========================== DEFINIÇÕES ========================== */
+// DEFINIÇÕES
 #define DEBUG_ADC_PORT GPIOB
 #define DEBUG_ADC_PIN  GPIO_PIN_8 //(GPIO DE PULSO PRA ADC)
 #define DEBUG_IZH_PORT GPIOB
@@ -20,7 +20,7 @@
 #define DIFF_BUFFER 25
 static uint8_t row_mask = 0x1E;
 
-/* ===== IZH PARAMETERS ===== */
+// IZH PARAMETERS
 
 /* Adap Rapida */
 #define A_RA 0.1f
@@ -45,7 +45,33 @@ static uint8_t row_mask = 0x1E;
 #define USB_PACKET_SIZE 64
 #define SEND_INTERVAL_MS 100  // envio ADC a cada 10 ms
 
-/* ========================== ESTRUTURAS ========================== */
+// Para neuronio de segunda ordem
+#define TAU_SYN 4.0f
+#define G_MAX 1.0f
+#define E_SYN 0.0f
+
+#define TARGET_TAXEL 0 // taxel que estou usando pra fazer o neuronio de segunda ordem
+
+/////////////
+float gain_RA[NUM_TAXELS];
+float gain_SA[NUM_TAXELS];
+
+float gain_SA_init[NUM_TAXELS] = {
+        1.0, 1.0, 1.0, 1.0, 1.0,
+        1.0, 1.0, 1.0, 1.0, 1.0,
+        1.0, 1.0, 1.0, 1.0, 1.0,
+        1.0, 1.0, 1.0, 1.0, 1.0,
+        1.0, 1.0, 1.0, 1.0, 1.0
+    };
+
+float gain_RA_init[NUM_TAXELS] = {
+    	1.0, 1.0, 1.0, 1.0, 1.0,
+		1.0, 1.0, 1.0, 1.0, 1.0,
+		1.0, 1.0, 1.0, 1.0, 1.0,
+    	1.0, 1.0, 1.0, 1.0, 1.0,
+    	1.0, 1.0, 1.0, 1.0, 1.0
+    };
+//  ESTRUTURAS
 typedef struct {
     float v_RA;
     float u_RA;
@@ -57,18 +83,18 @@ typedef struct {
 } Taxel;
 
 typedef struct {
-    GPIO_TypeDef *port;
-    uint16_t pin;
-} GPIO_Map;
+    float v;
+    float u;
+} Neuron2;
 
-/* ========================== HANDLES ========================== */
+// HANDLES
 ADC_HandleTypeDef hadc1;
 DMA_HandleTypeDef hdma_adc1;
 TIM_HandleTypeDef htim6;
 TIM_HandleTypeDef htim2;
 extern USBD_HandleTypeDef hUsbDeviceFS;
 
-/* ========================== VARIÁVEIS ========================== */
+// VARIÁVEIS
 Taxel taxels[NUM_TAXELS];
 uint16_t adc_buffer[COLS];
 uint8_t current_row = 0;
@@ -85,17 +111,12 @@ uint8_t usb_tx_buffer[USB_TX_BUFFER_SIZE];
 volatile uint16_t usb_head = 0;
 volatile uint16_t usb_tail = 0;
 
+float g_syn_RA[NUM_TAXELS] = {0};
+float g_syn_SA[NUM_TAXELS] = {0};
 
-/* ========================== GPIO MAP ========================== */
-GPIO_Map rows[ROWS] = {
-		{GPIOF, GPIO_PIN_10},
-		{GPIOF, GPIO_PIN_5},
-		{GPIOF, GPIO_PIN_3},
-		{GPIOC, GPIO_PIN_3},
-		{GPIOC, GPIO_PIN_0}
-};
+Neuron2 neuron2;
 
-/* ========================== PROTÓTIPOS ========================== */
+// PROTÓTIPOS
 void SystemClock_Config(void);
 void MX_GPIO_Init(void);
 void MX_DMA_Init(void);
@@ -109,7 +130,11 @@ void send_adc_continuous(void);
 void usb_buffer_write(const char *data, uint16_t len);
 void usb_buffer_process(void);
 
-/* ========================== USB BUFFER ========================== */
+float update_synapse(float *g_syn, bool spike);
+float compute_Isyn(float g_syn, float v_post);
+
+
+// USB BUFFER
 void usb_buffer_write(const char *data, uint16_t len)
 {
     for (uint16_t i = 0; i < len; i++)
@@ -152,11 +177,19 @@ void usb_buffer_process(void)
     }
 }
 
-/* ========================== SELECT ROW ========================== */
+// SELECT ROW
 static inline uint8_t rol5(uint8_t v)
 {
     return ((v << 1) | (v >> 4)) & 0x1F;
 }
+
+const uint8_t row_masks[ROWS] = {
+    0b11110,
+    0b11101,
+    0b11011,
+    0b10111,
+    0b01111
+};
 
 void select_row(uint8_t row)
 {
@@ -168,10 +201,71 @@ void select_row(uint8_t row)
 	row_mask = rol5(row_mask);
 }
 
-/* ========================== IZHIKEVICH ========================== */
+// Modelo de Izhikevith
+
+bool izhikevich_step(float *v, float *u, float I,
+                     float a, float b, float c, float d)
+{
+    *v += DT * (0.04f * (*v) * (*v) + 5.0f * (*v) + 140.0f - (*u) + I);
+    *u += DT * (a * (b * (*v) - (*u)));
+
+    if (*v >= VTH)
+    {
+        *v = c;
+        *u += d;
+        return true;
+    }
+
+    return false;
+}
+
+float update_synapse(float *g_syn, bool spike)
+{
+    // decaimento
+    *g_syn -= (DT / TAU_SYN) * (*g_syn);
+
+    // incremento por spike
+    if (spike)
+        *g_syn += G_MAX;
+
+
+    return *g_syn;
+}
+
+float compute_Isyn(float g_syn, float v_post)
+{
+    return g_syn*50; //*(E_SYN - v_post);
+}
+
+void send_single_taxel_data(int idx, float I_syn, float g_syn, bool spike_ra, bool spike_sa)
+{
+    static uint32_t last_send = 0;
+    uint32_t tstamp = __HAL_TIM_GET_COUNTER(&htim2);
+
+    // controla taxa de envio
+    if ((tstamp - last_send) < 50000) return;
+    last_send = tstamp;
+
+    char msg[120];
+
+    int n = snprintf(msg, sizeof(msg),
+        "TAXEL,idx=%d,t=%lu,I=%.8f,g=%.8f,RA=%d,SA=%d\r\n",
+        idx, tstamp, I_syn, g_syn, spike_ra, spike_sa);
+
+    usb_buffer_write(msg, n);
+}
+
+// IZHIKEVICH
+
 void update_taxels(Taxel *t, uint16_t *adc, uint8_t row_idx)
 {
     HAL_GPIO_WritePin(DEBUG_IZH_PORT, DEBUG_IZH_PIN, GPIO_PIN_SET);
+
+    float I_total_RA = 0.0f;
+    float I_total_SA = 0.0f;
+
+    // GUARDA O ESTADO ANTERIOR DO NEURÔNIO PÓS
+    float v_post_prev = neuron2.v;
 
     for (int i = 0; i < COLS; i++)
     {
@@ -179,18 +273,16 @@ void update_taxels(Taxel *t, uint16_t *adc, uint8_t row_idx)
 
         float V = adc[i] * (V_MAX / 4095.0f);
         float Vn = (V_MAX - V) / (V_MAX - V_MIN);
-
         float I_raw = Vn;
 
-        /* ===== BUFFER DERIVADA ===== */
-
+        // DERIVADA
         uint8_t idx = I_index[global_idx];
         float I_old = I_buffer[global_idx][idx];
 
         I_buffer[global_idx][idx] = I_raw;
         I_index[global_idx] = (idx + 1) % DIFF_BUFFER;
 
-        float dI = fabsf(I_raw - I_old)/ (DIFF_BUFFER * DT);
+        float dI = fabsf(I_raw - I_old) / (DIFF_BUFFER * DT);
 
         if (dI < 0.02f)
             dI = 0;
@@ -198,49 +290,83 @@ void update_taxels(Taxel *t, uint16_t *adc, uint8_t row_idx)
         float I_RA = G_RA * dI;
         float I_SA = G_SA * I_raw;
 
-        /* ===== RAPID ADAPTATION ===== */
+        //NEURÔNIO RA
+        bool spike_ra = izhikevich_step(
+            &t[i].v_RA,
+            &t[i].u_RA,
+            I_RA,
+            A_RA, B_RA, C_RA, D_RA
+        );
 
-        float v = t[i].v_RA;
-        float u = t[i].u_RA;
-
-        v += DT * (0.04f*v*v + 5*v + 140 - u + I_RA);
-        u += DT * (A_RA * (B_RA * v - u));
-
-        if (v >= VTH)
-        {
-            v = C_RA;
-            u += D_RA;
+        if (spike_ra)
             spike_flags_RA[global_idx] = 1;
-        }
 
-        t[i].v_RA = v;
-        t[i].u_RA = u;
+        // NEURÔNIO SA
+        bool spike_sa = izhikevich_step(
+            &t[i].v_SA,
+            &t[i].u_SA,
+            I_SA,
+            A_SA, B_SA, C_SA, D_SA
+        );
 
-        /* ===== SLOW ADAPTATION ===== */
-
-        v = t[i].v_SA;
-        u = t[i].u_SA;
-
-        v += DT * (0.04f*v*v + 5*v + 140 - u + I_SA);
-        u += DT * (A_SA * (B_SA * v - u));
-
-        if (v >= VTH)
-        {
-            v = C_SA;
-            u += D_SA;
+        if (spike_sa)
             spike_flags_SA[global_idx] = 1;
-        }
 
-        t[i].v_SA = v;
-        t[i].u_SA = u;
+        // SINAPSES
+        float g_ra = update_synapse(&g_syn_RA[global_idx], spike_ra);
+        float g_sa = update_synapse(&g_syn_SA[global_idx], spike_sa);
+
+        float I_ra = compute_Isyn(g_ra, v_post_prev);
+        float I_sa = compute_Isyn(g_sa, v_post_prev);
+
+        // SOMA SEPARADA de RA E SA
+        I_total_RA += gain_RA[global_idx] * I_ra; // CORRENTE MULTILPLICADA PELO O GANHO DA MATRIZ
+        I_total_SA += gain_SA[global_idx] * I_sa;
+
+        //ENVIO DO TAXEL ESCOLHIDO
+        if (global_idx == TARGET_TAXEL)
+        {
+        	float I_syn = gain_RA[global_idx]*I_ra + gain_SA[global_idx]*I_sa;
+
+            send_single_taxel_data(
+                global_idx,
+                I_syn,
+                g_ra + g_sa,
+                spike_ra,
+                spike_sa
+            );
+        }
 
         last_adc[global_idx] = adc[i];
     }
 
+    // JUNTA TUDO NO FINAL
+    float I_total = I_total_RA + I_total_SA;
+
+    /* ===== NEURÔNIO DE SEGUNDA ORDEM ===== */
+    bool spike_post = izhikevich_step(
+        &neuron2.v,
+        &neuron2.u,
+        I_total,
+        A_SA, B_SA, C_SA, D_SA
+    );
+
+    // ENVIO SPIKE PÓS
+    if (spike_post)
+    {
+        char msg[80];
+        uint32_t tstamp = __HAL_TIM_GET_COUNTER(&htim2);
+
+        int n = snprintf(msg, sizeof(msg),
+            "POST,t=%lu,I_total=%.4f\r\n",
+            tstamp, I_total);
+
+        usb_buffer_write(msg, n);
+    }
+
     HAL_GPIO_WritePin(DEBUG_IZH_PORT, DEBUG_IZH_PIN, GPIO_PIN_RESET);
 }
-
-/* ========================== PROCESS SPIKES ========================== */
+// PROCESS SPIKES
 bool process_spikes(void)
 {
     static char batch_msg[USB_TX_BUFFER_SIZE];
@@ -287,7 +413,7 @@ bool process_spikes(void)
     return has_spike;
 }
 
-/* ========================== SEND ADC CONTINUOUS ========================== */
+// SEND ADC CONTINUOUS
 void send_adc_continuous(void)
 {
     static char batch_msg[USB_TX_BUFFER_SIZE];
@@ -319,7 +445,7 @@ void send_adc_continuous(void)
     }
 }
 
-/* ========================== CALLBACK ADC ========================== */
+// CALLBACK ADC
 void HAL_ADC_ConvCpltCallback(ADC_HandleTypeDef *hadc)
 {
     if (hadc == &hadc1)
@@ -331,15 +457,15 @@ void HAL_ADC_ConvCpltCallback(ADC_HandleTypeDef *hadc)
     	select_row(current_row); //Seleciona linha antes de processar ADC
         update_taxels(&taxels[current_row * COLS], adc_buffer, current_row);
         current_row = (current_row + 1) % ROWS;
-        if (current_row >= ROWS)
-			current_row=0;
+        //if (current_row >= ROWS)
+			//current_row=0;
 
         /////////////////////////////////
         HAL_GPIO_WritePin(DEBUG_ADC_PORT, DEBUG_ADC_PIN, GPIO_PIN_RESET);///// PULSO NO GPIO ADC NO FIM DIGITALIZAÇÃO
     }
 }
 
-/* ========================== MAIN ========================== */
+// MAIN
 int main(void)
 {
     HAL_Init();
@@ -351,6 +477,9 @@ int main(void)
     MX_TIM6_Init();
     MX_TIM2_Init();
     MX_USB_DEVICE_Init();
+
+    neuron2.v = -30.0f; //-30??? -65???
+    neuron2.u = B_SA * neuron2.v;
 
     for (int i = 0; i < NUM_TAXELS; i++)
     {
@@ -368,7 +497,15 @@ int main(void)
     HAL_TIM_Base_Start(&htim6);
     HAL_ADC_Start_DMA(&hadc1, (uint32_t*)adc_buffer, COLS);
 
+
+    for (int i = 0; i < NUM_TAXELS; i++)
+    {
+        gain_RA[i] = gain_RA_init[i];
+        gain_SA[i] = gain_SA_init[i];
+    }
+
     usb_buffer_write("BOOT OK\r\n", 9);
+
 
     while (1)
     {
@@ -381,7 +518,7 @@ int main(void)
     }
 }
 
-/* ========================== GPIO ========================== */
+// GPIO
 void MX_GPIO_Init(void)
 {
     __HAL_RCC_GPIOA_CLK_ENABLE();
@@ -408,7 +545,7 @@ void MX_GPIO_Init(void)
     HAL_GPIO_Init(GPIOA, &g);
 
     g.Pin = GPIO_PIN_2 | GPIO_PIN_4; // ADC6 e ADC9
-    HAL_GPIO_Init(GPIOF, &g);       // Ajuste dependendo do seu mapeamento
+    HAL_GPIO_Init(GPIOF, &g);
 
     ///////////////////////////////////////////////////////////
 
@@ -425,7 +562,7 @@ void MX_GPIO_Init(void)
     /////////////////////////////////////////////////////////////////
 }
 
-/* ========================== DMA ========================== */
+// DMA
 void MX_DMA_Init(void)
 {
     __HAL_RCC_DMA2_CLK_ENABLE();
@@ -453,7 +590,7 @@ void DMA2_Stream0_IRQHandler(void)
     HAL_DMA_IRQHandler(&hdma_adc1);
 }
 
-/* ========================== ADC ========================== */
+// ADC
 void MX_ADC1_Init(void)
 {
     __HAL_RCC_ADC1_CLK_ENABLE();
@@ -487,7 +624,7 @@ void MX_ADC1_Init(void)
     }
 }
 
-/* ========================== TIM6 ========================== */
+// TIM6
 void MX_TIM6_Init(void)
 {
     __HAL_RCC_TIM6_CLK_ENABLE();
@@ -504,7 +641,7 @@ void MX_TIM6_Init(void)
     HAL_TIMEx_MasterConfigSynchronization(&htim6, &s);
 }
 
-/* ========================== TIM2 ========================== */
+// ========================== TIM2
 void MX_TIM2_Init(void)
 {
     __HAL_RCC_TIM2_CLK_ENABLE();
@@ -515,7 +652,7 @@ void MX_TIM2_Init(void)
     HAL_TIM_Base_Init(&htim2);
 }
 
-/* ========================== CLOCK ========================== */
+// ========================== CLOCK ==========================
 void SystemClock_Config(void)
 {
     RCC_OscInitTypeDef o = {0};
