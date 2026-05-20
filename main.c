@@ -1,4 +1,3 @@
-
 #include "stm32f7xx_hal.h"
 #include "usb_device.h"
 #include "usbd_cdc_if.h"
@@ -36,6 +35,7 @@ static uint8_t row_mask = 0x1E;
 #define D_SA 8.0f
 #define G_SA 25.0f
 
+
 #define DT 0.10f
 
 #define VTH 30.0f
@@ -48,11 +48,12 @@ static uint8_t row_mask = 0x1E;
 // Para neuronio de segunda ordem
 #define TAU_SYN 4.0f
 #define G_MAX 1.0f
-#define E_SYN 0.0f
-
-#define TARGET_TAXEL 0 // taxel que estou usando pra fazer o neuronio de segunda ordem
 
 /////////////
+
+#define TEMPLATE_SIZE 20
+float g_template[TEMPLATE_SIZE];
+
 float gain_RA[NUM_TAXELS];
 float gain_SA[NUM_TAXELS];
 
@@ -114,6 +115,10 @@ volatile uint16_t usb_tail = 0;
 float g_syn_RA[NUM_TAXELS] = {0};
 float g_syn_SA[NUM_TAXELS] = {0};
 
+uint8_t template_idx_RA[NUM_TAXELS] = {0};
+uint8_t template_idx_SA[NUM_TAXELS] = {0}; // em qual posição do template cada neurônio está
+
+
 Neuron2 neuron2;
 
 // PROTÓTIPOS
@@ -130,8 +135,23 @@ void send_adc_continuous(void);
 void usb_buffer_write(const char *data, uint16_t len);
 void usb_buffer_process(void);
 
+
 float update_synapse(float *g_syn, bool spike);
 float compute_Isyn(float g_syn, float v_post);
+
+// VER VALOR POSIÇÃO DA PRIMEIRA
+
+void init_template(void)
+{
+    g_template[0] = 0.0f;
+
+    for(int i = 1; i < TEMPLATE_SIZE; i++)
+    {
+        g_template[i] =
+            G_MAX * expf(-(float)(i-1) / 4.0f);
+
+    }
+}
 
 
 // USB BUFFER
@@ -234,137 +254,231 @@ float update_synapse(float *g_syn, bool spike)
 
 float compute_Isyn(float g_syn, float v_post)
 {
-    return g_syn*50; //*(E_SYN - v_post);
+    return g_syn;
 }
 
-void send_single_taxel_data(int idx, float I_syn, float g_syn, bool spike_ra, bool spike_sa)
-{
-    static uint32_t last_send = 0;
-    uint32_t tstamp = __HAL_TIM_GET_COUNTER(&htim2);
-
-    // controla taxa de envio
-    if ((tstamp - last_send) < 50000) return;
-    last_send = tstamp;
-
-    char msg[120];
-
-    int n = snprintf(msg, sizeof(msg),
-        "TAXEL,idx=%d,t=%lu,I=%.8f,g=%.8f,RA=%d,SA=%d\r\n",
-        idx, tstamp, I_syn, g_syn, spike_ra, spike_sa);
-
-    usb_buffer_write(msg, n);
-}
 
 // IZHIKEVICH
-
 void update_taxels(Taxel *t, uint16_t *adc, uint8_t row_idx)
 {
-    HAL_GPIO_WritePin(DEBUG_IZH_PORT, DEBUG_IZH_PIN, GPIO_PIN_SET);
+    HAL_GPIO_WritePin(DEBUG_IZH_PORT,
+                      DEBUG_IZH_PIN,
+                      GPIO_PIN_SET);
 
-    float I_total_RA = 0.0f;
-    float I_total_SA = 0.0f;
-
-    // GUARDA O ESTADO ANTERIOR DO NEURÔNIO PÓS
-    float v_post_prev = neuron2.v;
+    static float I_total = 0.0f;
 
     for (int i = 0; i < COLS; i++)
     {
         int global_idx = row_idx * COLS + i;
 
+        // =====================================================
+        // NORMALIZAÇÃO ADC
+        // =====================================================
+
         float V = adc[i] * (V_MAX / 4095.0f);
-        float Vn = (V_MAX - V) / (V_MAX - V_MIN);
+
+        float Vn =
+            (V_MAX - V) / (V_MAX - V_MIN);
+
         float I_raw = Vn;
 
-        // DERIVADA
+        // =====================================================
+        // DERIVADA (RA)
+        // =====================================================
+
         uint8_t idx = I_index[global_idx];
-        float I_old = I_buffer[global_idx][idx];
+
+        float I_old =
+            I_buffer[global_idx][idx];
 
         I_buffer[global_idx][idx] = I_raw;
-        I_index[global_idx] = (idx + 1) % DIFF_BUFFER;
 
-        float dI = fabsf(I_raw - I_old) / (DIFF_BUFFER * DT);
+        I_index[global_idx] =
+            (idx + 1) % DIFF_BUFFER;
 
-        if (dI < 0.02f)
-            dI = 0;
+        float dI =
+            fabsf(I_raw - I_old) /
+            (DIFF_BUFFER * DT);
 
-        float I_RA = G_RA * dI;
+        if (fabsf(dI) < 0.01f)
+            dI = 0.0f;
+
+        // =====================================================
+        // CORRENTES SENSORIAIS
+        // =====================================================
+
+        float I_RA = G_RA * fabsf(dI);
+
         float I_SA = G_SA * I_raw;
 
-        //NEURÔNIO RA
+        // =====================================================
+        // NEURÔNIO RA
+        // =====================================================
+
         bool spike_ra = izhikevich_step(
             &t[i].v_RA,
             &t[i].u_RA,
             I_RA,
-            A_RA, B_RA, C_RA, D_RA
+            A_RA,
+            B_RA,
+            C_RA,
+            D_RA
         );
 
         if (spike_ra)
+        {
             spike_flags_RA[global_idx] = 1;
 
+            template_idx_RA[global_idx] = 1;
+        }
+
+        // =====================================================
         // NEURÔNIO SA
+        // =====================================================
+
         bool spike_sa = izhikevich_step(
             &t[i].v_SA,
             &t[i].u_SA,
             I_SA,
-            A_SA, B_SA, C_SA, D_SA
+            A_SA,
+            B_SA,
+            C_SA,
+            D_SA
         );
 
         if (spike_sa)
+        {
             spike_flags_SA[global_idx] = 1;
 
-        // SINAPSES
-        float g_ra = update_synapse(&g_syn_RA[global_idx], spike_ra);
-        float g_sa = update_synapse(&g_syn_SA[global_idx], spike_sa);
-
-        float I_ra = compute_Isyn(g_ra, v_post_prev);
-        float I_sa = compute_Isyn(g_sa, v_post_prev);
-
-        // SOMA SEPARADA de RA E SA
-        I_total_RA += gain_RA[global_idx] * I_ra; // CORRENTE MULTILPLICADA PELO O GANHO DA MATRIZ
-        I_total_SA += gain_SA[global_idx] * I_sa;
-
-        //ENVIO DO TAXEL ESCOLHIDO
-        if (global_idx == TARGET_TAXEL)
-        {
-        	float I_syn = gain_RA[global_idx]*I_ra + gain_SA[global_idx]*I_sa;
-
-            send_single_taxel_data(
-                global_idx,
-                I_syn,
-                g_ra + g_sa,
-                spike_ra,
-                spike_sa
-            );
+            template_idx_SA[global_idx] = 1;
         }
+
+        // =====================================================
+        // SOMA DOS PSPs RA
+        // =====================================================
+
+        float I_ra = 0.0f;
+
+        uint8_t idx_ra =
+            template_idx_RA[global_idx];
+
+        if(idx_ra > 0)
+        {
+            I_ra =
+                gain_RA[global_idx] *
+                g_template[idx_ra];
+
+            idx_ra++;
+
+            if(idx_ra >= TEMPLATE_SIZE)
+            {
+                idx_ra = 0;
+            }
+
+            template_idx_RA[global_idx] = idx_ra;
+        }
+
+        // =====================================================
+        // SOMA DOS PSPs SA
+        // =====================================================
+
+        float I_sa = 0.0f;
+
+        uint8_t idx_sa =
+            template_idx_SA[global_idx];
+
+        if(idx_sa > 0)
+        {
+            I_sa =
+                gain_SA[global_idx] *
+                g_template[idx_sa];
+
+            idx_sa++;
+
+            if(idx_sa >= TEMPLATE_SIZE)
+            {
+                idx_sa = 0;
+            }
+
+            template_idx_SA[global_idx] = idx_sa;
+        }
+
+        // =====================================================
+        // CORRENTE TOTAL
+        // =====================================================
+
+        I_total += 50 * compute_Isyn(
+            I_ra,
+            neuron2.v
+        );
+
+        I_total += 50 * compute_Isyn(
+            I_sa,
+            neuron2.v
+        );
+
+        // =====================================================
+        // DEBUG ADC
+        // =====================================================
 
         last_adc[global_idx] = adc[i];
     }
 
-    // JUNTA TUDO NO FINAL
-    float I_total = I_total_RA + I_total_SA;
+    // =========================================================
+    // ATUALIZA NEURÔNIO PÓS-SINÁPTICO
+    // =========================================================
 
-    /* ===== NEURÔNIO DE SEGUNDA ORDEM ===== */
-    bool spike_post = izhikevich_step(
-        &neuron2.v,
-        &neuron2.u,
-        I_total,
-        A_SA, B_SA, C_SA, D_SA
-    );
-
-    // ENVIO SPIKE PÓS
-    if (spike_post)
+    if (row_idx == (ROWS - 1))
     {
-        char msg[80];
-        uint32_t tstamp = __HAL_TIM_GET_COUNTER(&htim2);
 
-        int n = snprintf(msg, sizeof(msg),
-            "POST,t=%lu,I_total=%.4f\r\n",
-            tstamp, I_total);
+        uint32_t tstamp =
+            __HAL_TIM_GET_COUNTER(&htim2);
+
+        bool spike_post = izhikevich_step(
+            &neuron2.v,
+            &neuron2.u,
+            I_total,
+            A_SA,
+            B_SA,
+            C_SA,
+            D_SA
+        );
+
+        char msg[100];
+
+        int n = snprintf(
+            msg,
+            sizeof(msg),
+            "TOTAL,t=%lu,I=%.4f\r\n",
+            tstamp,
+            I_total
+        );
 
         usb_buffer_write(msg, n);
+
+        if (spike_post)
+        {
+            char msg2[80];
+
+            int n2 = snprintf(
+                msg2,
+                sizeof(msg2),
+                "POST,t=%lu,I_total=%.4f\r\n",
+                tstamp,
+                I_total
+            );
+
+            usb_buffer_write(msg2, n2);
+        }
+
+        // RESET DA CORRENTE GLOBAL
+
+        I_total = 0.0f;
     }
 
-    HAL_GPIO_WritePin(DEBUG_IZH_PORT, DEBUG_IZH_PIN, GPIO_PIN_RESET);
+    HAL_GPIO_WritePin(DEBUG_IZH_PORT,
+                      DEBUG_IZH_PIN,
+                      GPIO_PIN_RESET);
 }
 // PROCESS SPIKES
 bool process_spikes(void)
@@ -471,6 +585,8 @@ int main(void)
     HAL_Init();
     SystemClock_Config();
 
+    __HAL_RCC_GPIOA_CLK_ENABLE();
+
     MX_GPIO_Init();
     MX_DMA_Init();
     MX_ADC1_Init();
@@ -480,6 +596,8 @@ int main(void)
 
     neuron2.v = -30.0f; //-30??? -65???
     neuron2.u = B_SA * neuron2.v;
+
+    init_template();
 
     for (int i = 0; i < NUM_TAXELS; i++)
     {
