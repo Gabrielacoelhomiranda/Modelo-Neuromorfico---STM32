@@ -271,20 +271,12 @@ void update_taxels(Taxel *t, uint16_t *adc, uint8_t row_idx)
     {
         int global_idx = row_idx * COLS + i;
 
-        // =====================================================
-        // NORMALIZAÇÃO ADC
-        // =====================================================
-
         float V = adc[i] * (V_MAX / 4095.0f);
 
         float Vn =
             (V_MAX - V) / (V_MAX - V_MIN);
 
         float I_raw = Vn;
-
-        // =====================================================
-        // DERIVADA (RA)
-        // =====================================================
 
         uint8_t idx = I_index[global_idx];
 
@@ -303,17 +295,11 @@ void update_taxels(Taxel *t, uint16_t *adc, uint8_t row_idx)
         if (fabsf(dI) < 0.01f)
             dI = 0.0f;
 
-        // =====================================================
-        // CORRENTES SENSORIAIS
-        // =====================================================
 
         float I_RA = G_RA * fabsf(dI);
 
         float I_SA = G_SA * I_raw;
 
-        // =====================================================
-        // NEURÔNIO RA
-        // =====================================================
 
         bool spike_ra = izhikevich_step(
             &t[i].v_RA,
@@ -332,9 +318,6 @@ void update_taxels(Taxel *t, uint16_t *adc, uint8_t row_idx)
             template_idx_RA[global_idx] = 1;
         }
 
-        // =====================================================
-        // NEURÔNIO SA
-        // =====================================================
 
         bool spike_sa = izhikevich_step(
             &t[i].v_SA,
@@ -353,9 +336,6 @@ void update_taxels(Taxel *t, uint16_t *adc, uint8_t row_idx)
             template_idx_SA[global_idx] = 1;
         }
 
-        // =====================================================
-        // SOMA DOS PSPs RA
-        // =====================================================
 
         float I_ra = 0.0f;
 
@@ -378,9 +358,6 @@ void update_taxels(Taxel *t, uint16_t *adc, uint8_t row_idx)
             template_idx_RA[global_idx] = idx_ra;
         }
 
-        // =====================================================
-        // SOMA DOS PSPs SA
-        // =====================================================
 
         float I_sa = 0.0f;
 
@@ -403,9 +380,9 @@ void update_taxels(Taxel *t, uint16_t *adc, uint8_t row_idx)
             template_idx_SA[global_idx] = idx_sa;
         }
 
-        // =====================================================
+
         // CORRENTE TOTAL
-        // =====================================================
+
 
         I_total += 50 * compute_Isyn(
             I_ra,
@@ -417,16 +394,9 @@ void update_taxels(Taxel *t, uint16_t *adc, uint8_t row_idx)
             neuron2.v
         );
 
-        // =====================================================
-        // DEBUG ADC
-        // =====================================================
-
         last_adc[global_idx] = adc[i];
     }
 
-    // =========================================================
-    // ATUALIZA NEURÔNIO PÓS-SINÁPTICO
-    // =========================================================
 
     if (row_idx == (ROWS - 1))
     {
@@ -471,7 +441,6 @@ void update_taxels(Taxel *t, uint16_t *adc, uint8_t row_idx)
             usb_buffer_write(msg2, n2);
         }
 
-        // RESET DA CORRENTE GLOBAL
 
         I_total = 0.0f;
     }
